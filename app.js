@@ -1,22 +1,22 @@
 /* ============================================================
    Agenzia TUTTO - applicazione (router + viste)
 
-   Il client Supabase (window.sb) lo crea auth.js, che carica DOPO
-   questo file: qui dentro non si tocca sb prima di App.boot().
+   Sito statico: il catalogo sta in catalogo.js (window.CATALOGO), il
+   carrello nel browser (localStorage). L'ordine parte come messaggio
+   WhatsApp verso il numero in config.js: niente account, niente database.
 
    Rotte (hash, refresh-safe):
      #/                              home agenzia (griglia servizi)
      #/<servizio>                    collezioni del servizio
      #/<servizio>/<collezione>       maglie della collezione
      #/<servizio>/<collezione>/<slug> dettaglio maglia
-     #/carrello  #/checkout  #/ordini  #/ordini/<numero>  #/account
+     #/carrello  #/checkout  #/ordine-inviato
    ============================================================ */
 'use strict';
 
 window.App = (function () {
-  const APP_VER = 'v17';
+  const APP_VER = 'v18';
   const AP = String.fromCharCode(39);   // apostrofo, per non litigare con le virgolette
-  const NET_TIMEOUT = 15000;
 
   const viewEl = document.getElementById('view');
   const toastEl = document.getElementById('toast');
@@ -27,15 +27,12 @@ window.App = (function () {
 
   const state = {
     booted: false,
-    uid: null,
-    profile: null,
     servizi: [],
     collezioni: {},      // servizio_id -> [collezioni]
     conteggi: {},        // collezione_id -> n prodotti
     prodotti: {},        // collezione_id -> [prodotti]
     cart: [],
-    ordini: null,
-    ordineInSospeso: false,   // stava ordinando quando gli abbiamo chiesto l'account
+    ultimoOrdine: null,  // testo dell'ultimo messaggio WhatsApp, per il "riapri"
   };
 
   // stato locale della vista dettaglio (taglia/quantita' scelte)
@@ -50,14 +47,6 @@ window.App = (function () {
     return String(s == null ? '' : s)
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-  }
-
-  // rete lenta: meglio un errore che una UI impallata per sempre
-  function withTimeout(promise, ms = NET_TIMEOUT) {
-    return Promise.race([
-      promise,
-      new Promise((_, rej) => setTimeout(() => rej(new Error('Connessione lenta o assente. Riprova.')), ms)),
-    ]);
   }
 
   let toastTimer = null;
@@ -135,43 +124,42 @@ window.App = (function () {
 
   /* ---------------- accesso ai dati ---------------- */
 
-  async function q(builder) {
-    const { data, error } = await withTimeout(builder);
-    if (error) throw new Error(error.message || 'Errore di rete');
-    return data;
-  }
+  const CAT = window.CATALOGO || { servizi: [], collezioni: [], prodotti: [] };
 
+  // restano async come quando i dati arrivavano dalla rete: le viste non cambiano
   async function loadServizi() {
-    if (state.servizi.length) return state.servizi;
-    state.servizi = await q(window.sb.from('servizi').select('*').order('ordine')) || [];
+    if (!state.servizi.length) state.servizi = CAT.servizi.filter((s) => s.stato !== 'nascosto');
     return state.servizi;
   }
 
   async function loadCollezioni(servizioId) {
     if (state.collezioni[servizioId]) return state.collezioni[servizioId];
-    const coll = await q(window.sb.from('collezioni').select('*').eq('servizio_id', servizioId).order('ordine')) || [];
+    const coll = CAT.collezioni.filter((c) => c.servizio_id === servizioId && c.attiva);
     state.collezioni[servizioId] = coll;
-    // conteggio maglie per collezione: il catalogo e' piccolo, una query sola basta
-    if (coll.length) {
-      const righe = await q(window.sb.from('prodotti').select('id, collezione_id')
-        .in('collezione_id', coll.map((c) => c.id))) || [];
-      state.conteggi = {};
-      righe.forEach((r) => { state.conteggi[r.collezione_id] = (state.conteggi[r.collezione_id] || 0) + 1; });
-    }
+    coll.forEach((c) => { state.conteggi[c.id] = CAT.prodotti.filter((p) => p.collezione_id === c.id).length; });
     return coll;
   }
 
   async function loadProdotti(collezioneId) {
-    if (state.prodotti[collezioneId]) return state.prodotti[collezioneId];
-    const p = await q(window.sb.from('prodotti').select('*').eq('collezione_id', collezioneId).order('ordine')) || [];
-    state.prodotti[collezioneId] = p;
-    return p;
+    if (!state.prodotti[collezioneId]) {
+      state.prodotti[collezioneId] = CAT.prodotti
+        .filter((p) => p.collezione_id === collezioneId)
+        .sort((a, b) => a.ordine - b.ordine);
+    }
+    return state.prodotti[collezioneId];
   }
 
-  /* Carrello: chi ha l'account ce l'ha sul server (lo ritrova su ogni
-     dispositivo), chi non ce l'ha ancora lo tiene nel browser. Al primo
-     accesso il secondo si travasa nel primo. */
+  // solo le maglie di collezioni accese si possono avere nel carrello
+  function prodottoOrdinabile(id) {
+    const p = CAT.prodotti.find((x) => x.id === id);
+    if (!p) return null;
+    const c = CAT.collezioni.find((x) => x.id === p.collezione_id);
+    return c && c.attiva ? Object.assign({ collezione_nome: c.nome }, p) : null;
+  }
+
+  /* Carrello: vive nel browser. Una riga = maglia + taglia. */
   const CART_KEY = 'agenzia.carrello';
+  const NOME_KEY = 'agenzia.nome';
 
   function cartLocale() {
     try { return JSON.parse(localStorage.getItem(CART_KEY)) || []; } catch (_) { return []; }
@@ -179,55 +167,22 @@ window.App = (function () {
   function salvaCartLocale(righe) {
     try { localStorage.setItem(CART_KEY, JSON.stringify(righe)); } catch (_) { /* modalita' privata */ }
   }
-  const idLocale = (prodottoId, taglia) => 'loc:' + prodottoId + ':' + taglia;
+  const idRiga = (prodottoId, taglia) => prodottoId + ':' + taglia;
 
   async function loadCart() {
-    if (loggato()) {
-      state.cart = await q(window.sb.from('carrello_righe')
-        .select('id, prodotto_id, taglia, quantita, prodotti(id, slug, nome, prezzo_cent, immagini, collezione_id)')
-        .order('created_at')) || [];
-    } else {
-      const righe = cartLocale();
-      if (!righe.length) {
-        state.cart = [];
-      } else {
-        const prodotti = await q(window.sb.from('prodotti')
-          .select('id, slug, nome, prezzo_cent, immagini, collezione_id')
-          .in('id', righe.map((r) => r.prodotto_id))) || [];
-        const perId = Object.fromEntries(prodotti.map((p) => [p.id, p]));
-        // se una maglia e' sparita dal catalogo, la riga sparisce dal carrello
-        state.cart = righe.filter((r) => perId[r.prodotto_id]).map((r) => ({
-          id: idLocale(r.prodotto_id, r.taglia),
-          prodotto_id: r.prodotto_id,
-          taglia: r.taglia,
-          quantita: r.quantita,
-          prodotti: perId[r.prodotto_id],
-        }));
-      }
-    }
+    // se una maglia e' sparita dal catalogo (o era del vecchio sito), la riga sparisce
+    state.cart = cartLocale()
+      .map((r) => ({ r, p: prodottoOrdinabile(r.prodotto_id) }))
+      .filter((x) => x.p)
+      .map(({ r, p }) => ({
+        id: idRiga(r.prodotto_id, r.taglia),
+        prodotto_id: r.prodotto_id,
+        taglia: r.taglia,
+        quantita: r.quantita,
+        prodotti: p,
+      }));
     aggiornaBadge();
     return state.cart;
-  }
-
-  // all'accesso il carrello del browser diventa quello dell'account
-  async function unisciCarrelloLocale() {
-    const righe = cartLocale();
-    if (!righe.length) return;
-    const esistenti = await q(window.sb.from('carrello_righe').select('id, prodotto_id, taglia, quantita')) || [];
-    for (const r of righe) {
-      const gia = esistenti.find((e) => e.prodotto_id === r.prodotto_id && e.taglia === r.taglia);
-      try {
-        if (gia) {
-          await q(window.sb.from('carrello_righe')
-            .update({ quantita: Math.min(99, gia.quantita + r.quantita), updated_at: new Date().toISOString() })
-            .eq('id', gia.id));
-        } else {
-          await q(window.sb.from('carrello_righe')
-            .insert({ user_id: state.uid, prodotto_id: r.prodotto_id, taglia: r.taglia, quantita: r.quantita }));
-        }
-      } catch (_) { /* una riga persa non deve bloccare l'accesso */ }
-    }
-    salvaCartLocale([]);
   }
 
   function aggiornaBadge() {
@@ -236,40 +191,15 @@ window.App = (function () {
     cartBadge.hidden = n === 0;
   }
 
-  const loggato = () => !!state.uid;
-
-  // chiede l'accesso solo quando serve davvero (carrello, ordini, profilo)
-  function chiediAccesso(motivo) {
-    if (window.Auth && window.Auth.apri) window.Auth.apri(motivo);
-  }
-
-  function invitoAccesso(titolo, testo) {
-    return emptyState(ICO.utente, titolo, testo,
-      '<button class="btn" data-action="accedi">Accedi o iscriviti</button>');
-  }
-
   const totaleCarrello = () =>
     state.cart.reduce((s, r) => s + r.quantita * ((r.prodotti && r.prodotti.prezzo_cent) || 0), 0);
 
   async function aggiungiAlCarrello(prodottoId, taglia, qta) {
-    if (!loggato()) {
-      const righe = cartLocale();
-      const gia = righe.find((r) => r.prodotto_id === prodottoId && r.taglia === taglia);
-      if (gia) gia.quantita = Math.min(99, gia.quantita + qta);
-      else righe.push({ prodotto_id: prodottoId, taglia, quantita: qta });
-      salvaCartLocale(righe);
-      await loadCart();
-      return;
-    }
-    const esistente = state.cart.find((r) => r.prodotto_id === prodottoId && r.taglia === taglia);
-    if (esistente) {
-      const nuova = Math.min(99, esistente.quantita + qta);
-      await q(window.sb.from('carrello_righe')
-        .update({ quantita: nuova, updated_at: new Date().toISOString() }).eq('id', esistente.id));
-    } else {
-      await q(window.sb.from('carrello_righe')
-        .insert({ user_id: state.uid, prodotto_id: prodottoId, taglia, quantita: qta }));
-    }
+    const righe = cartLocale();
+    const gia = righe.find((r) => r.prodotto_id === prodottoId && r.taglia === taglia);
+    if (gia) gia.quantita = Math.min(99, gia.quantita + qta);
+    else righe.push({ prodotto_id: prodottoId, taglia, quantita: qta });
+    salvaCartLocale(righe);
     await loadCart();
   }
 
@@ -279,17 +209,10 @@ window.App = (function () {
     const nuova = riga.quantita + delta;
     if (nuova <= 0) return rimuoviRiga(rigaId, true);
     if (nuova > 99) return;
-    if (!loggato()) {
-      const righe = cartLocale();
-      const l = righe.find((r) => r.prodotto_id === riga.prodotto_id && r.taglia === riga.taglia);
-      if (l) l.quantita = nuova;
-      salvaCartLocale(righe);
-      await loadCart();
-      renderCarrello();
-      return;
-    }
-    await q(window.sb.from('carrello_righe')
-      .update({ quantita: nuova, updated_at: new Date().toISOString() }).eq('id', rigaId));
+    const righe = cartLocale();
+    const l = righe.find((r) => r.prodotto_id === riga.prodotto_id && r.taglia === riga.taglia);
+    if (l) l.quantita = nuova;
+    salvaCartLocale(righe);
     await loadCart();
     renderCarrello();
   }
@@ -300,39 +223,38 @@ window.App = (function () {
       if (!ok) return;
     }
     const riga = state.cart.find((r) => r.id === rigaId);
-    if (!loggato()) {
-      salvaCartLocale(cartLocale().filter((r) => !(riga && r.prodotto_id === riga.prodotto_id && r.taglia === riga.taglia)));
-    } else {
-      await q(window.sb.from('carrello_righe').delete().eq('id', rigaId));
-    }
+    salvaCartLocale(cartLocale().filter((r) => !(riga && r.prodotto_id === riga.prodotto_id && r.taglia === riga.taglia)));
     await loadCart();
     renderCarrello();
   }
 
-  async function loadOrdini(force = false) {
-    if (state.ordini && !force) return state.ordini;
-    state.ordini = await q(window.sb.from('ordini')
-      .select('*, ordini_righe(*)')
-      .order('created_at', { ascending: false })) || [];
-    return state.ordini;
+  /* L'ordine e' un messaggio WhatsApp gia' scritto: chi ordina lo invia dal
+     suo telefono, quindi il numero per ricontattarlo arriva da se'. */
+  function testoOrdine(nome, note) {
+    const righe = state.cart.map((r) => {
+      const p = r.prodotti;
+      return '- ' + r.quantita + ' x ' + p.nome + ' (' + p.collezione_nome + '), taglia ' + r.taglia +
+        ': ' + euro(r.quantita * p.prezzo_cent);
+    });
+    const capi = state.cart.reduce((s, r) => s + r.quantita, 0);
+    return [
+      'Ciao! Vorrei ordinare queste maglie dal sito Agenzia TUTTO:',
+      '',
+      ...righe,
+      '',
+      'Totale: ' + euro(totaleCarrello()) + ' (' + capi + (capi === 1 ? ' capo' : ' capi') + ')',
+      '',
+      'Nome: ' + nome,
+      note ? 'Note: ' + note : null,
+      '',
+      'Pago al ritiro.',
+    ].filter((x) => x !== null).join('\n');
   }
 
-  /* ---------------- stati ordine ---------------- */
-
-  const STATI = [
-    ['in_attesa_pagamento', 'Da pagare'],
-    ['pagato', 'Pagato'],
-    ['in_stampa', 'In stampa'],
-    ['pronto', 'Pronto per il ritiro'],
-    ['consegnato', 'Consegnato'],
-  ];
-  const etichettaStato = (s) => (s === 'annullato' ? 'Annullato' : (STATI.find((x) => x[0] === s) || [, s])[1]);
-
-  const dataIt = (iso) => new Date(iso).toLocaleDateString('it-IT', { day: '2-digit', month: 'long', year: 'numeric' });
+  const linkWhatsApp = (testo) =>
+    'https://wa.me/' + window.AGENZIA_CONFIG.WA_ORDINI + '?text=' + encodeURIComponent(testo);
 
   /* ---------------- router ---------------- */
-
-  const RISERVATE = ['carrello', 'checkout', 'ordini', 'account'];
 
   function segmenti() {
     const h = location.hash.replace(/^#\/?/, '');
@@ -351,8 +273,7 @@ window.App = (function () {
       if (!s.length) return await renderHome();
       if (s[0] === 'carrello') return await vistaCarrello();
       if (s[0] === 'checkout') return await renderCheckout();
-      if (s[0] === 'ordini') return s[1] ? await renderOrdine(s[1]) : await renderOrdini();
-      if (s[0] === 'account') return renderAccount();
+      if (s[0] === 'ordine-inviato') return renderOrdineInviato();
       if (s.length === 1) return await renderServizio(s[0]);
       if (s.length === 2) return await renderCollezione(s[0], s[1]);
       return await renderProdotto(s[0], s[1], s[2]);
@@ -369,12 +290,10 @@ window.App = (function () {
       const g = (t.dataset.goto || '').replace(/^#\/?/, '');
       const attivo = (g === '' && s.length === 0) || (g !== '' && primo === g);
       t.classList.toggle('is-active', attivo);
-      if (t.dataset.solo === 'loggato') t.hidden = !loggato();
-      if (t.dataset.solo === 'visitatore') t.hidden = loggato();
     });
     const sub = {
       '': 'Facciamo tutto', carrello: 'Il tuo carrello', checkout: 'Conferma ordine',
-      ordini: 'I tuoi ordini', account: 'Il tuo profilo',
+      'ordine-inviato': 'Ordine su WhatsApp',
     };
     if (sub[primo] !== undefined) {
       topSub.textContent = sub[primo];
@@ -666,9 +585,9 @@ window.App = (function () {
     await loadCart();
     if (!state.cart.length) return vai('#/carrello');
 
-    const pr = state.profile || {};
-    const nome = [pr.nome, pr.cognome].filter(Boolean).join(' ') || pr.username || '';
     const capi = state.cart.reduce((s, r) => s + r.quantita, 0);
+    let nome = '';
+    try { nome = localStorage.getItem(NOME_KEY) || ''; } catch (_) { /* niente */ }
 
     viewEl.innerHTML = `
       <p class="crumb">Ultimo passo</p>
@@ -678,10 +597,10 @@ window.App = (function () {
         ${state.cart.map((r) => `
           <div class="riga-ordine">
             <div>
-              <div>${esc((r.prodotti || {}).nome)}</div>
+              <div>${esc(r.prodotti.nome)}</div>
               <div class="q">Taglia ${esc(r.taglia)} - quantità ${r.quantita}</div>
             </div>
-            <div class="p">${euro(r.quantita * ((r.prodotti || {}).prezzo_cent || 0))}</div>
+            <div class="p">${euro(r.quantita * r.prodotti.prezzo_cent)}</div>
           </div>`).join('')}
         <div class="r tot"><span>Totale (${capi})</span><span class="v">${euro(totaleCarrello())}</span></div>
       </div>
@@ -692,175 +611,48 @@ window.App = (function () {
           <input id="ckNome" type="text" autocomplete="name" value="${esc(nome)}" required />
         </label>
         <label class="field">
-          <span>Telefono</span>
-          <input id="ckTel" type="tel" inputmode="tel" autocomplete="tel" value="${esc(pr.telefono || '')}" placeholder="es. 333 1234567" required />
-        </label>
-        <label class="field">
           <span>Note (facoltative)</span>
           <textarea id="ckNote" placeholder="Quando passi a ritirare, richieste particolari..."></textarea>
         </label>
         <p class="form-msg" id="ckMsg" hidden></p>
-        <button class="btn block" id="ckBtn" type="submit"><span class="lbl">${loggato() ? 'Invia ordine' : "Accedi e invia l'ordine"}</span></button>
+        <button class="btn block" id="ckBtn" type="submit"><span class="lbl">Invia l'ordine su WhatsApp</span></button>
       </form>
       <p class="muted" style="margin:14px 0 0;font-size:12.5px;line-height:1.5">
-        Nessun pagamento online: l'ordine resta da pagare finché non ci vediamo. Ritiro a mano.
+        Si apre WhatsApp con l'ordine già scritto: ti basta premere invia.
+        Nessun pagamento online, paghi al ritiro.
       </p>`;
   }
 
-  async function inviaOrdine() {
-    if (!loggato()) {
-      // il carrello resta dov'e': dopo l'accesso si travasa nell'account
-      state.ordineInSospeso = true;
-      chiediAccesso("Ultimo passo: accedi o iscriviti per inviare l'ordine. Il carrello resta com'è.");
-      return;
-    }
-    const btn = document.getElementById('ckBtn');
+  function inviaOrdine() {
     const msg = document.getElementById('ckMsg');
     const nome = document.getElementById('ckNome').value.trim();
-    const tel = document.getElementById('ckTel').value.trim();
     const note = document.getElementById('ckNote').value.trim();
 
     msg.hidden = true;
-    if (!nome || !tel) {
-      msg.textContent = 'Servono nome e telefono per accordarci sul ritiro.';
+    if (!nome) {
+      msg.textContent = 'Scrivi il tuo nome, così sappiamo di chi è l' + AP + 'ordine.';
       msg.hidden = false;
       return;
     }
+    try { localStorage.setItem(NOME_KEY, nome); } catch (_) { /* niente */ }
 
-    btn.disabled = true;
-    btn.innerHTML = '<span class="lbl">Invio...</span><span class="spin-dot"></span>';
-    try {
-      const { data, error } = await withTimeout(
-        window.sb.rpc('crea_ordine', { p_nome: nome, p_telefono: tel, p_note: note || null })
-      );
-      if (error) throw new Error(error.message || 'Ordine non riuscito');
-
-      // il telefono lo teniamo sul profilo: al prossimo ordine e' gia' li'
-      if (!state.profile || state.profile.telefono !== tel) {
-        try {
-          await withTimeout(window.sb.from('profiles').update({ telefono: tel }).eq('id', state.uid));
-          if (state.profile) state.profile.telefono = tel;
-        } catch (_) { /* non e' un motivo per bloccare l'ordine */ }
-      }
-
-      state.ordini = null;
-      await loadCart();
-      toast('Ordine ' + data.numero + ' inviato!');
-      vai('#/ordini/' + encodeURIComponent(data.numero));
-    } catch (err) {
-      msg.textContent = err.message || 'Ordine non riuscito. Riprova.';
-      msg.hidden = false;
-      btn.disabled = false;
-      btn.innerHTML = '<span class="lbl">Invia ordine</span>';
-    }
+    state.ultimoOrdine = testoOrdine(nome, note);
+    // aperto qui, dentro il clic: altrimenti il browser lo blocca come popup
+    window.open(linkWhatsApp(state.ultimoOrdine), '_blank', 'noopener');
+    vai('#/ordine-inviato');
   }
 
-  async function renderOrdini() {
-    if (!loggato()) {
-      viewEl.innerHTML = '<div class="section-title"><h2>I tuoi ordini</h2></div>' +
-        invitoAccesso('Qui finiscono i tuoi ordini', 'Accedi per vedere cosa hai ordinato e a che punto è.');
-      return;
-    }
-    viewEl.innerHTML = `<div class="section-title"><h2>I tuoi ordini</h2></div>${skeletonGrid(2)}`;
-    const ordini = await loadOrdini(true);
-    if (!ordini.length) {
-      viewEl.innerHTML = `
-        <div class="section-title"><h2>I tuoi ordini</h2></div>
-        ${emptyState(ICO.box, 'Nessun ordine', 'Quando ordini una maglia la trovi qui, con il suo stato.',
-          '<a class="btn" href="#/magliette">Vai alle maglie</a>')}`;
-      return;
-    }
+  /* Dopo WhatsApp: il carrello NON si svuota da solo, perche' non sappiamo
+     se il messaggio e' partito davvero. Lo svuota chi ordina. */
+  function renderOrdineInviato() {
+    if (!state.ultimoOrdine) return vai('#/carrello');
     viewEl.innerHTML = `
-      <div class="section-title"><h2>I tuoi ordini</h2><span class="count">${ordini.length}</span></div>
-      ${ordini.map((o) => {
-        const capi = (o.ordini_righe || []).reduce((s, r) => s + r.quantita, 0);
-        return `
-        <a class="ordine-card" href="#/ordini/${esc(o.numero)}">
-          <div class="head">
-            <span class="num">${esc(o.numero)}</span>
-            <span class="stato s-${esc(o.stato)}">${esc(etichettaStato(o.stato))}</span>
-          </div>
-          <p class="data">${esc(dataIt(o.created_at))} - ${capi} ${capi === 1 ? 'capo' : 'capi'}</p>
-          <p class="tot">${euro(o.totale_cent)}</p>
-        </a>`;
-      }).join('')}`;
-  }
-
-  async function renderOrdine(numero) {
-    if (!loggato()) return renderOrdini();
-    const ordini = await loadOrdini();
-    const o = ordini.find((x) => x.numero === numero);
-    if (!o) {
-      viewEl.innerHTML = emptyState(ICO.box, 'Ordine non trovato', 'Controlla nella lista dei tuoi ordini.',
-        '<a class="btn ghost" href="#/ordini">I tuoi ordini</a>');
-      return;
-    }
-    const idx = STATI.findIndex((s) => s[0] === o.stato);
-    const timeline = o.stato === 'annullato'
-      ? '<li class="now"><span class="dot"></span>Ordine annullato</li>'
-      : STATI.map((s, i) => {
-          const cls = i < idx ? 'done' : (i === idx ? 'now' : '');
-          return `<li class="${cls}"><span class="dot"></span>${esc(s[1])}</li>`;
-        }).join('');
-
-    viewEl.innerHTML = `
-      <p class="crumb">Ordine</p>
-      <div class="section-title"><h2>${esc(o.numero)}</h2><span class="stato s-${esc(o.stato)}">${esc(etichettaStato(o.stato))}</span></div>
-      <p class="muted" style="margin:0;font-size:13.5px">${esc(dataIt(o.created_at))}</p>
-
-      <div class="riepilogo">
-        ${(o.ordini_righe || []).map((r) => `
-          <div class="riga-ordine">
-            <div>
-              <div>${esc(r.nome_prodotto)}</div>
-              <div class="q">Taglia ${esc(r.taglia)} - quantità ${r.quantita}${r.collezione_nome ? ' - ' + esc(r.collezione_nome) : ''}</div>
-            </div>
-            <div class="p">${euro(r.quantita * r.prezzo_unit_cent)}</div>
-          </div>`).join('')}
-        <div class="r tot"><span>Totale</span><span class="v">${euro(o.totale_cent)}</span></div>
-      </div>
-
-      <div class="section-title"><h2>A che punto siamo</h2></div>
-      <ul class="timeline">${timeline}</ul>
-
-      <div class="riepilogo">
-        <div class="r"><span>Ritiro</span><span>A mano</span></div>
-        <div class="r"><span>Contatto</span><span>${esc(o.nome_contatto)}</span></div>
-        <div class="r"><span>Telefono</span><span>${esc(o.telefono)}</span></div>
-        ${o.note ? `<div class="r"><span>Note</span><span>${esc(o.note)}</span></div>` : ''}
-      </div>
-      <p class="muted" style="margin:14px 0 0;font-size:12.5px;line-height:1.5">${esc(window.AGENZIA_CONFIG.CONTATTO_RITIRO || '')}</p>`;
-  }
-
-  function renderAccount() {
-    if (!loggato()) {
-      viewEl.innerHTML = invitoAccesso('Nessun account',
-        'Accedi o iscriviti per ordinare le maglie e seguire i tuoi ordini.');
-      return;
-    }
-    const p = state.profile || {};
-    const iniziale = (p.nome || p.username || '?').trim().charAt(0).toUpperCase();
-    const nomeCompleto = [p.nome, p.cognome].filter(Boolean).join(' ');
-    viewEl.innerHTML = `
-      <div class="acc-head">
-        <div class="acc-avatar">${esc(iniziale)}</div>
-        <div>
-          <h2>${esc(nomeCompleto || p.username || '')}</h2>
-          <p>@${esc(p.username || '')}</p>
-        </div>
-      </div>
-
-      <a class="list-link" href="#/ordini"><span>I tuoi ordini</span>${ICO.chev}</a>
-      <a class="list-link" href="#/carrello"><span>Carrello</span>${ICO.chev}</a>
-
-      <div class="riepilogo">
-        ${p.email ? `<div class="r"><span>Email</span><span>${esc(p.email)}</span></div>` : ''}
-        <div class="r"><span>Telefono</span><span>${esc(p.telefono || 'non indicato')}</span></div>
-        <div class="r"><span>Versione</span><span>${APP_VER}</span></div>
-      </div>
-
-      <div style="margin-top:18px">
-        <button class="btn ghost block" data-action="logout">Esci</button>
+      <div class="section-title"><h2>Ci sei quasi</h2></div>
+      ${emptyState(ICO.whatsapp, 'Premi invia su WhatsApp',
+        'Abbiamo preparato il messaggio con il tuo ordine: quando ci arriva ti rispondiamo per il ritiro e il pagamento.',
+        `<a class="btn" href="${esc(linkWhatsApp(state.ultimoOrdine))}" target="_blank" rel="noopener">Riapri WhatsApp</a>`)}
+      <div style="margin-top:8px">
+        <button class="btn ghost block" data-action="ordine-fatto">Messaggio inviato, svuota il carrello</button>
       </div>`;
   }
 
@@ -875,9 +667,14 @@ window.App = (function () {
     if (a === 'qta-meno') { pick.qta = Math.max(1, pick.qta - 1); aggiornaPick(); return; }
     if (a === 'qta-piu') { pick.qta = Math.min(99, pick.qta + 1); aggiornaPick(); return; }
     if (a === 'ricarica') { route(); return; }
-    if (a === 'logout') { window.Auth && window.Auth.logout(); return; }
-
-    if (a === 'accedi') { chiediAccesso(); return; }
+    if (a === 'ordine-fatto') {
+      salvaCartLocale([]);
+      state.ultimoOrdine = null;
+      await loadCart();
+      toast('Grazie! Ci sentiamo su WhatsApp');
+      vai('#/');
+      return;
+    }
 
     if (a === 'aggiungi') {
       if (!pick.taglia) return;
@@ -935,7 +732,6 @@ window.App = (function () {
     const voce = e.target.closest('.menu-item');
     if (!voce) return;
     apriMenu(false);
-    if (voce.dataset.azione === 'accedi') return chiediAccesso();
     vai(voce.dataset.goto);
   });
   document.addEventListener('click', (e) => {
@@ -947,58 +743,13 @@ window.App = (function () {
 
   /* ---------------- avvio ---------------- */
 
-  // uid null = visitatore: il catalogo si guarda lo stesso, l'account serve
-  // solo per carrello e ordini.
-  async function boot(uid) {
-    state.uid = uid || null;
+  async function boot() {
     state.booted = true;
-    state.profile = null;
-    state.ordini = null;
-    state.cart = [];
-
-    // Il catalogo dipende da CHI guarda: l'admin vede anche le collezioni
-    // spente. Entrando o uscendo si buttano le cache e si rilegge tutto,
-    // altrimenti resterebbe in pagina la roba dell'utente precedente.
-    state.servizi = [];
-    state.collezioni = {};
-    state.conteggi = {};
-    state.prodotti = {};
-
-    if (state.uid) {
-      try {
-        const prof = await q(window.sb.from('profiles').select('*').eq('id', state.uid).maybeSingle());
-        state.profile = prof || null;
-      } catch (_) { state.profile = null; }
-      try { await unisciCarrelloLocale(); } catch (_) { /* si riprova al prossimo accesso */ }
-      try { await loadCart(); } catch (_) { /* il badge riprova al prossimo giro */ }
-    } else {
-      await loadCart().catch(() => { state.cart = []; aggiornaBadge(); });
-    }
-
-    // se stava ordinando quando gli abbiamo chiesto l'account, lo riportiamo li'
-    if (state.uid && state.ordineInSospeso) {
-      state.ordineInSospeso = false;
-      if (state.cart.length) {
-        toast("Bentornato: ora puoi inviare l'ordine");
-        if (location.hash !== '#/checkout') return vai('#/checkout');
-      }
-    }
+    await loadCart();
     await route();
   }
 
-  function reset() {
-    state.booted = false;
-    state.uid = null;
-    state.profile = null;
-    state.servizi = [];
-    state.collezioni = {};
-    state.conteggi = {};
-    state.prodotti = {};
-    state.cart = [];
-    state.ordini = null;
-    viewEl.innerHTML = '';
-    cartBadge.hidden = true;
-  }
+  boot();
 
-  return { boot, reset, route, toast, state, APP_VER };
+  return { route, toast, state, APP_VER };
 })();
