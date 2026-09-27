@@ -132,7 +132,7 @@
       slug: 'beer-film', servizio_id: 'magliette', nome: 'Beer&FILM', anno: 2026,
       descrizione: 'Locandine di film riscritte a birra. La collezione 2026.',
       cover: 'img/collezioni/beer-film.svg', formato: '35 / 51',
-      attiva: false,   // non ancora uscita: la accende Roberto quando e' ora
+      attiva: true,
       prezzo_cent: 4000,
       maglie: [
         ['lord-of-the-beer', 'Lord of the Beer', 'The Lord of the Rings'],
