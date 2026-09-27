@@ -15,7 +15,7 @@
 'use strict';
 
 window.App = (function () {
-  const APP_VER = 'v19';
+  const APP_VER = 'v20';
   const AP = String.fromCharCode(39);   // apostrofo, per non litigare con le virgolette
 
   const viewEl = document.getElementById('view');

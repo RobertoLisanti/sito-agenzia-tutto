@@ -133,7 +133,7 @@
       descrizione: 'Locandine di film riscritte a birra. La collezione 2026.',
       cover: 'img/collezioni/beer-film.svg', formato: '35 / 51',
       attiva: true,
-      prezzo_cent: 4000,
+      prezzo_cent: 5000,
       maglie: [
         ['lord-of-the-beer', 'Lord of the Beer', 'The Lord of the Rings'],
         ['the-beer-of-wall-street', 'The Beer of Wall Street', 'The Wolf of Wall Street'],
@@ -156,7 +156,7 @@
       descrizione: 'Vip e birre fusi in un gioco di parole. La collezione 2025, quella che ha sfondato.',
       cover: 'img/collezioni/beer-vip.svg', formato: '1 / 1',
       attiva: true,
-      prezzo_cent: 4000,
+      prezzo_cent: 5000,
       maglie: [
         ['dua-ipa', 'Dua Ipa', 'Dua Lipa × IPA'],
         ['beerlusconi', 'Beerlusconi', 'Silvio Berlusconi × beer'],
